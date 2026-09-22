@@ -113,21 +113,27 @@ type secretRule struct {
 	keywords    []string // 已小写；空表示该规则总是参与
 	entropy     float64
 	secretGroup int
+	allowlists  []*allowlist // 规则级豁免
 }
 
 type secretDetector struct {
 	rules   []secretRule
-	skipped int // 因正则语法不兼容被跳过的规则数（Go RE2 下通常为 0）
+	global  []*allowlist // 顶层豁免，对所有规则生效
+	skipped int          // 正则无法编译而被跳过的规则数 + 豁免条目数（Go RE2 下通常为 0）
 }
 
-// gitleaks.toml 的最小结构；未知字段（allowlist 等）会被忽略。
+// gitleaks.toml 的最小结构；未涉及的字段（paths 等）会被忽略。
 type tomlConfig struct {
-	Rules []struct {
-		ID          string   `toml:"id"`
-		Regex       string   `toml:"regex"`
-		Keywords    []string `toml:"keywords"`
-		Entropy     float64  `toml:"entropy"`
-		SecretGroup int      `toml:"secretGroup"`
+	Allowlist  tomlAllowlist   `toml:"allowlist"`
+	Allowlists []tomlAllowlist `toml:"allowlists"`
+	Rules      []struct {
+		ID          string          `toml:"id"`
+		Regex       string          `toml:"regex"`
+		Keywords    []string        `toml:"keywords"`
+		Entropy     float64         `toml:"entropy"`
+		SecretGroup int             `toml:"secretGroup"`
+		Allowlist   tomlAllowlist   `toml:"allowlist"`
+		Allowlists  []tomlAllowlist `toml:"allowlists"`
 	} `toml:"rules"`
 }
 
@@ -141,6 +147,8 @@ func newSecretDetector(tomlPath string) (*secretDetector, error) {
 	if _, err := toml.DecodeFile(tomlPath, &cfg); err != nil {
 		return nil, err
 	}
+	global, bad := parseAllowlists(append([]tomlAllowlist{cfg.Allowlist}, cfg.Allowlists...))
+	sd.global, sd.skipped = global, sd.skipped+bad
 	for _, r := range cfg.Rules {
 		if r.Regex == "" {
 			continue
@@ -154,7 +162,16 @@ func newSecretDetector(tomlPath string) (*secretDetector, error) {
 		for i, k := range r.Keywords {
 			kws[i] = strings.ToLower(k)
 		}
-		sd.rules = append(sd.rules, secretRule{r.ID, re, kws, r.Entropy, r.SecretGroup})
+		als, bad := parseAllowlists(append([]tomlAllowlist{r.Allowlist}, r.Allowlists...))
+		sd.skipped += bad
+		sd.rules = append(sd.rules, secretRule{
+			id:          r.ID,
+			re:          re,
+			keywords:    kws,
+			entropy:     r.Entropy,
+			secretGroup: r.SecretGroup,
+			allowlists:  als,
+		})
 	}
 	if len(sd.rules) == 0 {
 		sd.loadBuiltin()
@@ -177,7 +194,11 @@ func (sd *secretDetector) loadBuiltin() {
 		{"private-key", `-----BEGIN[A-Z ]*PRIVATE KEY-----`, []string{"private key"}},
 	}
 	for _, b := range builtin {
-		sd.rules = append(sd.rules, secretRule{b.id, regexp.MustCompile(b.pat), b.kws, 0, 0})
+		sd.rules = append(sd.rules, secretRule{
+			id:       b.id,
+			re:       regexp.MustCompile(b.pat),
+			keywords: b.kws,
+		})
 	}
 }
 
@@ -200,8 +221,19 @@ func (sd *secretDetector) detect(text string) []span {
 			if s < 0 || s >= e {
 				continue
 			}
-			if r.entropy > 0 && shannonEntropy(text[s:e]) < r.entropy {
-				continue // 复刻 gitleaks 的熵阈值，压低误报
+			// 密钥本身（上游 finding.Secret）：指定了 secretGroup 就取该分组，
+			// 否则取第一个非空分组；规则没有分组时才是整段匹配。熵、stopwords、
+			// regexTarget=secret 的豁免都比对它，而不是比整段匹配 —— 否则像
+			// generic-api-key 的 stopwords（含 "password"）会把 `password": "xxx"`
+			// 整段匹配里的关键字也算进去，连带放过真正的口令。
+			secret := text[s:e]
+			if r.secretGroup == 0 {
+				if g := firstNonEmptyGroup(m, text); g != "" {
+					secret = g
+				}
+			}
+			if r.entropy > 0 && shannonEntropy(secret) <= r.entropy {
+				continue // 复刻 gitleaks 的熵阈值与比较方式，压低误报
 			}
 			// 命中含 URL 或域名前缀（generic-api-key 把 api.x.com:path 一起吃的情形）
 			// 或明显是模板/UUID/hash/业务 ID/占位符/JSON 噪声时跳过。
@@ -212,6 +244,13 @@ func (sd *secretDetector) detect(text string) []span {
 				isTemplateVar(cand) || isHexHash(cand) || isUUID(cand) ||
 				isBusinessIDAssignment(cand) ||
 				isLikelyPlaceholder(cand) || hasJSONNoise(cand) {
+				continue
+			}
+			// gitleaks 的豁免条目（规则级 + 顶层）：例如 generic-api-key 的
+			// allowlist 用 "author" 挡掉 Co-Authored-By 这类署名行。
+			match := text[m[0]:m[1]]
+			line := lineAt(text, m[0], m[1])
+			if allowsAny(r.allowlists, match, secret, line) || allowsAny(sd.global, match, secret, line) {
 				continue
 			}
 			spans = append(spans, span{s, e, "[密钥]"})
@@ -227,6 +266,9 @@ func (sd *secretDetector) detect(text string) []span {
 			}
 			// 低熵短串（"REPLACE_ME" / "TODO" / "null" / "abc" 等占位符）跳过
 			if len(value) <= 16 && shannonEntropy(value) < 3.0 {
+				continue
+			}
+			if allowsAny(sd.global, value, value, lineAt(text, m[4], m[5])) {
 				continue
 			}
 			spans = append(spans, span{m[4], m[5], "[密钥]"})
@@ -251,6 +293,9 @@ func (sd *secretDetector) detect(text string) []span {
 			threshold = entropyMinStrict
 		}
 		if shannonEntropy(cand) >= threshold {
+			if allowsAny(sd.global, cand, cand, lineAt(text, s, e)) {
+				continue
+			}
 			spans = append(spans, span{s, e, "[密钥]"})
 		}
 	}
@@ -358,6 +403,18 @@ func isBusinessIDAssignment(s string) bool {
 		}
 	}
 	return false
+}
+
+// firstNonEmptyGroup 返回第一个非空捕获分组，复刻上游 detect.go 在未配置
+// secretGroup 时对 finding.Secret 的取值。规则没有分组时返回空串。
+func firstNonEmptyGroup(m []int, text string) string {
+	for g := 1; 2*g+1 < len(m); g++ {
+		start, end := m[2*g], m[2*g+1]
+		if start >= 0 && end > start {
+			return text[start:end]
+		}
+	}
+	return ""
 }
 
 // ruleApplies 做关键词预筛：无关键词的规则总是参与，
