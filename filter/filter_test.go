@@ -57,6 +57,48 @@ func TestBankCardInvalidLuhnIgnored(t *testing.T) {
 	}
 }
 
+// --- 选择性关闭 PII 检测器 ---
+
+func TestDisabledPIIEmailKeepsEmailRedactsOthers(t *testing.T) {
+	f, err := NewWithOptions("../rules/gitleaks.toml", Options{DisabledPII: []string{PIIEmail}})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	got := redact(t, f, "邮箱 alice@example.com 手机 13812345678")
+	if strings.Contains(got, "[邮箱]") {
+		t.Errorf("邮箱检测已关闭，却仍被脱敏: %q", got)
+	}
+	if !strings.Contains(got, "alice@example.com") {
+		t.Errorf("邮箱原文应原样保留: %q", got)
+	}
+	if !strings.Contains(got, "[电话]") {
+		t.Errorf("仅关闭邮箱时手机号仍应脱敏: %q", got)
+	}
+}
+
+func TestDisabledPIITypeIsNormalized(t *testing.T) {
+	f, err := NewWithOptions("../rules/gitleaks.toml", Options{DisabledPII: []string{"  EMAIL  "}})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	if got := redact(t, f, "联系 alice@example.com"); strings.Contains(got, "[邮箱]") {
+		t.Errorf("类型标识的大小写与空白应被归一化: %q", got)
+	}
+}
+
+func TestUnknownPIITypeKeepsDefault(t *testing.T) {
+	if IsKnownPIIType("emails") {
+		t.Fatal("emails 不应被识别为合法 PII 类型")
+	}
+	f, err := NewWithOptions("../rules/gitleaks.toml", Options{DisabledPII: []string{"emails"}})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	if got := redact(t, f, "联系 alice@example.com"); !strings.Contains(got, "[邮箱]") {
+		t.Errorf("未知类型不应改变默认脱敏行为: %q", got)
+	}
+}
+
 // --- 密钥层 ---
 
 func TestGitleaksRulesLoaded(t *testing.T) {

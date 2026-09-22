@@ -33,17 +33,36 @@ type span struct {
 
 // Filter 持有编译好的规则。创建后只读，可并发安全地复用。
 type Filter struct {
-	secrets *secretDetector
+	secrets     *secretDetector
+	disabledPII map[string]bool
+}
+
+// Options 控制各检测层的行为。零值等价于全部检测器启用。
+type Options struct {
+	// DisabledPII 列出要关闭的结构化 PII 检测器，取值见 PIIEmail 等常量。
+	// 取值大小写不敏感，空白会被裁掉；空值即全部启用。
+	DisabledPII []string
 }
 
 // New 创建一个 Filter。gitleaksTOML 为 gitleaks 规则文件路径；
 // 传空字符串则只用内置兜底规则。文件存在但解析失败时返回 error。
 func New(gitleaksTOML string) (*Filter, error) {
+	return NewWithOptions(gitleaksTOML, Options{})
+}
+
+// NewWithOptions 与 New 相同，额外可关闭指定的结构化 PII 检测器。
+func NewWithOptions(gitleaksTOML string, opts Options) (*Filter, error) {
 	sd, err := newSecretDetector(gitleaksTOML)
 	if err != nil {
 		return nil, err
 	}
-	return &Filter{secrets: sd}, nil
+	disabled := make(map[string]bool, len(opts.DisabledPII))
+	for _, t := range opts.DisabledPII {
+		if t = NormalizePIIType(t); t != "" {
+			disabled[t] = true
+		}
+	}
+	return &Filter{secrets: sd, disabledPII: disabled}, nil
 }
 
 // Stats 返回已加载的规则数，以及因语法不兼容被跳过的规则数。
@@ -54,8 +73,8 @@ func (f *Filter) Stats() (rules, skipped int) {
 // Redact 检测并脱敏文本。并发安全。
 func (f *Filter) Redact(text string) Result {
 	var spans []span
-	spans = append(spans, detectPII(text)...)        // 结构化 PII
-	spans = append(spans, f.secrets.detect(text)...) // 密钥 / 凭证
+	spans = append(spans, detectPII(text, f.disabledPII)...) // 结构化 PII
+	spans = append(spans, f.secrets.detect(text)...)         // 密钥 / 凭证
 
 	merged := mergeSpans(spans)
 

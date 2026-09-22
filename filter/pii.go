@@ -15,6 +15,34 @@ var (
 	reIPv4     = regexp.MustCompile(`(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])`)
 )
 
+// 结构化 PII 检测器的标识。Options.DisabledPII 用这些值选择性关闭。
+const (
+	PIIEmail    = "email"
+	PIIPhone    = "phone"
+	PIIIDCard   = "id_card"
+	PIIIP       = "ip"
+	PIIBankCard = "bank_card"
+)
+
+// PIITypes 列出全部结构化 PII 检测器标识，供调用方校验配置。
+var PIITypes = []string{PIIEmail, PIIPhone, PIIIDCard, PIIIP, PIIBankCard}
+
+// NormalizePIIType 归一化 PII 类型标识：去掉首尾空白并转小写。
+func NormalizePIIType(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// IsKnownPIIType 判断标识是否为已支持的结构化 PII 检测器。
+func IsKnownPIIType(s string) bool {
+	t := NormalizePIIType(s)
+	for _, known := range PIITypes {
+		if t == known {
+			return true
+		}
+	}
+	return false
+}
+
 // 远程命令前缀。user@host 出现在这些命令上下文里通常是 SSH 目标，不是邮箱。
 var sshCommands = []string{"ssh ", "scp ", "rsync ", "sftp ", "ssh-copy-id ", "ssh-keygen "}
 
@@ -73,39 +101,49 @@ func luhnValid(num string) bool {
 	return sum%10 == 0
 }
 
-// detectPII 返回结构化 PII 的命中区间。
-func detectPII(text string) []span {
+// detectPII 返回结构化 PII 的命中区间。disabled 里的检测器会被跳过，nil 表示全部启用。
+func detectPII(text string, disabled map[string]bool) []span {
 	var spans []span
-	for _, m := range reEmail.FindAllStringIndex(text, -1) {
-		// SSH-style URL: user@host:path —— 邮箱后紧接 ":" + 非空白字符 → 视作 git@ URL，不脱
-		if m[1] < len(text) && text[m[1]] == ':' &&
-			m[1]+1 < len(text) && text[m[1]+1] != ' ' && text[m[1]+1] != '\t' {
-			continue
-		}
-		// SSH 命令上下文：ssh / scp / rsync user@host 这种调用，host 不是邮箱
-		if isInSSHCommandContext(text, m[0]) {
-			continue
-		}
-		spans = append(spans, span{m[0], m[1], "[邮箱]"})
-	}
-	for _, m := range rePhoneCN.FindAllStringIndex(text, -1) {
-		if digitBounded(text, m[0], m[1]) {
-			spans = append(spans, span{m[0], m[1], "[电话]"})
+	if !disabled[PIIEmail] {
+		for _, m := range reEmail.FindAllStringIndex(text, -1) {
+			// SSH-style URL: user@host:path —— 邮箱后紧接 ":" + 非空白字符 → 视作 git@ URL，不脱
+			if m[1] < len(text) && text[m[1]] == ':' &&
+				m[1]+1 < len(text) && text[m[1]+1] != ' ' && text[m[1]+1] != '\t' {
+				continue
+			}
+			// SSH 命令上下文：ssh / scp / rsync user@host 这种调用，host 不是邮箱
+			if isInSSHCommandContext(text, m[0]) {
+				continue
+			}
+			spans = append(spans, span{m[0], m[1], "[邮箱]"})
 		}
 	}
-	for _, m := range reIDCard.FindAllStringIndex(text, -1) {
-		if digitBounded(text, m[0], m[1]) {
-			spans = append(spans, span{m[0], m[1], "[身份证]"})
+	if !disabled[PIIPhone] {
+		for _, m := range rePhoneCN.FindAllStringIndex(text, -1) {
+			if digitBounded(text, m[0], m[1]) {
+				spans = append(spans, span{m[0], m[1], "[电话]"})
+			}
 		}
 	}
-	for _, m := range reIPv4.FindAllStringIndex(text, -1) {
-		if ipBounded(text, m[0], m[1]) {
-			spans = append(spans, span{m[0], m[1], "[IP]"})
+	if !disabled[PIIIDCard] {
+		for _, m := range reIDCard.FindAllStringIndex(text, -1) {
+			if digitBounded(text, m[0], m[1]) {
+				spans = append(spans, span{m[0], m[1], "[身份证]"})
+			}
 		}
 	}
-	for _, m := range reBankCard.FindAllStringIndex(text, -1) {
-		if digitBounded(text, m[0], m[1]) && luhnValid(text[m[0]:m[1]]) {
-			spans = append(spans, span{m[0], m[1], "[银行卡]"})
+	if !disabled[PIIIP] {
+		for _, m := range reIPv4.FindAllStringIndex(text, -1) {
+			if ipBounded(text, m[0], m[1]) {
+				spans = append(spans, span{m[0], m[1], "[IP]"})
+			}
+		}
+	}
+	if !disabled[PIIBankCard] {
+		for _, m := range reBankCard.FindAllStringIndex(text, -1) {
+			if digitBounded(text, m[0], m[1]) && luhnValid(text[m[0]:m[1]]) {
+				spans = append(spans, span{m[0], m[1], "[银行卡]"})
+			}
 		}
 	}
 	return spans
