@@ -223,6 +223,55 @@ func TestEntropyFallbackStrictThresholdSkipsModerateEntropy(t *testing.T) {
 	}
 }
 
+// 回归 case（2026-09-23）：反编译 prompt 里的代码符号名不是密钥。
+// 起因：CNetworkGameServerBase_CheckPassword 被熵兜底抹成 [密钥]（熵 4.03），
+// 因为关键词 Password 就在候选串内部，被当成「强密钥上下文」绕过路径检查。
+func TestEntropyFallbackSkipsSymbolName(t *testing.T) {
+	f := newFilter(t)
+	cases := []string{
+		"llm_decompile request ready for CNetworkGameServerBase_CheckPassword: platform=windows, model=deepseek-flash",
+		"calling llm_decompile for CNetworkGameServer_GetFreeClient, CNetworkGameServerBase_CheckPassword with model=deepseek-flash",
+		"Preprocess: failed to locate CNetworkGameServerBase_CheckPassword",
+		"Start skill: find-CNetworkGameServerBase_GetPassword OK",
+		"Start skill: find-CNetworkGameServerBase_GetPlayerNetworkIDString OK",
+		"找到 CNetworkGameServerBase::CheckPassword 的调用点",
+		"用 token CNetworkGameServerBase_CheckPassword 做锚点",
+	}
+	for _, in := range cases {
+		if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+			t.Errorf("符号名被误判成密钥: in=%q got=%q", in, got)
+		}
+	}
+}
+
+// 标识符尾巴 + 冒号不是「关键词: 值」赋值结构。
+func TestContextPasswordSkipsIdentifierTail(t *testing.T) {
+	f := newFilter(t)
+	in := "llm_decompile request ready for CNetworkGameServerBase_CheckPassword: platform=windows, model=deepseek-flash"
+	if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+		t.Errorf("标识符尾巴被当成关键词赋值: %q", got)
+	}
+}
+
+// 反面：关掉符号名误报的同时，真密钥仍要脱。
+func TestSymbolNameRuleKeepsRealSecrets(t *testing.T) {
+	f := newFilter(t)
+	cases := []string{
+		"我的密码是 Hunter2xyz",
+		"配置里 api_key = aB3xK9pLmN2qR7sT",
+		"DB_PASSWORD=hunter2xyz9", // 下划线前缀的关键词 + 赋值结构仍算上下文
+		"MY_API_KEY=8f3a2b1c9d4e5f60718293a4",
+		"token aB3xK9pLmN2qR7sT5vW1zY",
+		"Authorization: Bearer abcDEF1234567890/xyzABC4567890==",
+		"临时凭证 aB3xK9pLmN2qR7sT5vW1zY 已生成",
+	}
+	for _, in := range cases {
+		if got := redact(t, f, in); !strings.Contains(got, "[密钥]") {
+			t.Errorf("真密钥漏脱: in=%q got=%q", in, got)
+		}
+	}
+}
+
 // --- 强上下文凌驾路径检查 ---
 
 // Bearer 真密钥含 base64 padding 的 / —— 不能被 Step 1 当路径放过。

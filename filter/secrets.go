@@ -259,6 +259,11 @@ func (sd *secretDetector) detect(text string) []span {
 	// 上下文口令：只脱掉 value（第 2 个分组）
 	for _, m := range reContextSecret.FindAllStringSubmatchIndex(text, -1) {
 		if len(m) >= 6 && m[4] >= 0 {
+			// 关键词必须处于词首：`..._CheckPassword: xxx` 里的 Password 只是标识符
+			// 片段，不构成「关键词: 值」赋值结构。
+			if !keywordBounded(text, m[2]) {
+				continue
+			}
 			value := text[m[4]:m[5]]
 			// 模板变量（${TOKEN} / {{ X }} 等）不是真值，跳过
 			if isTemplateVar(value) {
@@ -284,8 +289,9 @@ func (sd *secretDetector) detect(text string) []span {
 		if !strong && isOnPathOrURLBoundary(text, s, e) {
 			continue
 		}
-		// 形态识别：模板变量 / 标准 hash / UUID / 业务 ID 都不是密钥
-		if isTemplateVar(cand) || isHexHash(cand) || isUUID(cand) || isBusinessIDAssignment(cand) {
+		// 形态识别：模板变量 / 标准 hash / UUID / 业务 ID / 代码符号名都不是密钥
+		if isTemplateVar(cand) || isHexHash(cand) || isUUID(cand) ||
+			isBusinessIDAssignment(cand) || isSymbolName(cand) {
 			continue
 		}
 		threshold := entropyMin
@@ -327,14 +333,61 @@ func isOnPathOrURLBoundary(text string, start, end int) bool {
 	return false
 }
 
-// hasSecretContext 检查 [start-contextLookback, end) 区间是否出现密钥语义关键词，
+// hasSecretContext 检查候选串之前是否出现密钥语义关键词（后端 30 字节），
 // 命中保留 entropyMin，否则改用更严的 entropyMinStrict。
+// 关键词落在候选串内部时只有真实的赋值结构（api_key=xxx）才算数：否则
+// CNetworkGameServerBase_CheckPassword 这类「关键词只是标识符尾巴」的符号名
+// 会自带伪上下文，把普通代码标识符拖进密钥判定。
 func hasSecretContext(text string, start, end int) bool {
 	lo := start - contextLookback
 	if lo < 0 {
 		lo = 0
 	}
-	return reSecretContext.MatchString(text[lo:end])
+	before := text[lo:start]
+	for _, loc := range reSecretContext.FindAllStringIndex(before, -1) {
+		if keywordBounded(before, loc[0]) {
+			return true
+		}
+	}
+	return keywordInsideAssignment(text[start:end])
+}
+
+// keywordBounded 判断关键词是否位于「词首」：紧贴在字母 / 数字之后的所谓关键词
+// 只是更长标识符的片段（Check**Password**、x**auth**），不构成密钥语义上下文。
+// 下划线不算粘连 —— DB_PASSWORD / api_key 这类命名里关键词本就是独立词段。
+func keywordBounded(text string, start int) bool {
+	if start <= 0 {
+		return true
+	}
+	switch text[start-1] {
+	case '_':
+		return true
+	}
+	return !isWordCharByte(text[start-1])
+}
+
+// isWordCharByte 判断字节是否为标识符字符（ASCII 字母 / 数字）。
+func isWordCharByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+}
+
+// keywordInsideAssignment 判断候选串内部是否出现「关键词紧接赋值分隔符」的结构
+// （api_key=xxx / token:xxx）。关键词只是标识符尾巴（..._CheckPassword）时返回 false。
+func keywordInsideAssignment(cand string) bool {
+	low := strings.ToLower(cand)
+	for _, loc := range reSecretContext.FindAllStringIndex(low, -1) {
+		if !keywordBounded(low, loc[0]) {
+			continue
+		}
+		i := loc[1]
+		for i < len(low) && (low[i] == ' ' || low[i] == '\t') {
+			i++
+		}
+		if i < len(low) && (low[i] == '=' || low[i] == ':') {
+			return true
+		}
+	}
+	return false
 }
 
 // hasStrongSecretContext 比 hasSecretContext 更严：要求"关键词紧贴候选串"，
@@ -351,15 +404,19 @@ func hasStrongSecretContext(text string, start, end int) bool {
 		return true
 	}
 	region := text[lo:end]
-	locs := reSecretContext.FindAllStringIndex(region, -1)
-	if len(locs) == 0 {
+	var last []int
+	for _, loc := range reSecretContext.FindAllStringIndex(region, -1) {
+		if keywordBounded(region, loc[0]) {
+			last = loc
+		}
+	}
+	if last == nil {
 		return false
 	}
-	last := locs[len(locs)-1]
 	candStartInRegion := start - lo
-	// 关键词起点 >= 候选起点 → 关键词本身就在候选串里（如 token=xxx 整段都匹配）→ 强
+	// 关键词起点落在候选串内 → 只有「关键词 + 赋值分隔符」才算强上下文
 	if last[0] >= candStartInRegion {
-		return true
+		return keywordInsideAssignment(text[start:end])
 	}
 	// 关键词在 lookback 里：检查关键词结束 → 候选起点 之间是否只剩赋值字符
 	between := region[last[1]:candStartInRegion]
@@ -403,6 +460,33 @@ func isBusinessIDAssignment(s string) bool {
 		}
 	}
 	return false
+}
+
+// isSymbolName 识别「代码符号名 / 标识符」形态：整串只由 ASCII 字母、下划线、
+// 连字符、冒号组成（不含数字与 base64 的 + / =），且呈驼峰或分段的分词结构。
+// 形如 CNetworkGameServerBase_CheckPassword 的符号名会被高熵兜底误当随机串，
+// 而真密钥几乎总含数字或 +/= 符号，故跳过这一形态不会漏掉它们。
+func isSymbolName(s string) bool {
+	var separators, humps int
+	prevLower := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			prevLower = true
+		case c >= 'A' && c <= 'Z':
+			if prevLower {
+				humps++
+			}
+			prevLower = false
+		case c == '_' || c == '-' || c == ':':
+			separators++
+			prevLower = false
+		default:
+			return false // 数字或其它字符 → 不是标识符形态
+		}
+	}
+	return separators >= 1 || humps >= 2
 }
 
 // firstNonEmptyGroup 返回第一个非空捕获分组，复刻上游 detect.go 在未配置
